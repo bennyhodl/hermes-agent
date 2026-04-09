@@ -1579,49 +1579,6 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        # Check for built-in interactive commands
-        first_word = text.split()[0].lower() if text else ""
-        
-        if first_word in ("help", "skills", "status", "config"):
-            # Handle with interactive command handlers
-            from gateway.platforms.slack_commands import (
-                SlashCommandContext,
-                dispatch_slash_command,
-            )
-            
-            ctx = SlashCommandContext(
-                user_id=user_id,
-                channel_id=channel_id,
-                team_id=team_id,
-                trigger_id=trigger_id,
-                response_url=response_url,
-                adapter=self,
-            )
-            
-            result = await dispatch_slash_command(text, ctx)
-
-            # Send ephemeral response
-            client = self._get_client(channel_id)
-            try:
-                await client.chat_postEphemeral(
-                    channel=channel_id,
-                    user=user_id,
-                    text=result.text,
-                    blocks=result.blocks if result.blocks else None,
-                )
-            except Exception as e:
-                logger.error("[Slack] Failed to send ephemeral for /%s: %s", first_word, e)
-                # Fallback: send text-only ephemeral
-                try:
-                    await client.chat_postEphemeral(
-                        channel=channel_id,
-                        user=user_id,
-                        text=result.text or f"Error running /{first_word}",
-                    )
-                except Exception:
-                    pass
-            return
-
         # Map subcommands to gateway commands — derived from central registry.
         # Also keep "compact" as a Slack-specific alias for /compress.
         from hermes_cli.commands import slack_subcommand_map
