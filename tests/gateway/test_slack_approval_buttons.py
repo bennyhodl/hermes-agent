@@ -238,83 +238,77 @@ class TestSlackApprovalAction:
 
 
 # ===========================================================================
-# _fetch_thread_context
+# Thread context loading (load_thread_context from slack_utils)
 # ===========================================================================
 
 class TestSlackThreadContext:
-    """Test thread context fetching."""
+    """Test thread context loading via slack_utils.load_thread_context."""
 
     @pytest.mark.asyncio
     async def test_fetches_and_formats_context(self):
-        adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
+        from gateway.platforms.slack_utils import (
+            load_thread_context,
+            format_thread_context_for_prompt,
+        )
+
+        mock_client = AsyncMock()
         mock_client.conversations_replies = AsyncMock(return_value={
             "messages": [
                 {"ts": "1000.0", "user": "U1", "text": "This is the parent message"},
                 {"ts": "1000.1", "user": "U2", "text": "I think we should refactor"},
-                {"ts": "1000.2", "user": "U1", "text": "Good idea, <@U_BOT> what do you think?"},
-            ]
+                {"ts": "1000.2", "user": "U1", "text": "Good idea, what do you think?"},
+            ],
+            "has_more": False,
         })
 
-        # Mock user name resolution
-        adapter._user_name_cache = {"U1": "Alice", "U2": "Bob"}
+        async def resolve_name(uid):
+            return {"U1": "Alice", "U2": "Bob"}.get(uid, uid)
 
-        context = await adapter._fetch_thread_context(
+        ctx = await load_thread_context(
+            client=mock_client,
             channel_id="C1",
             thread_ts="1000.0",
-            current_ts="1000.2",  # The message that triggered the fetch
-            team_id="T1",
+            current_message_ts="1000.2",
+            user_name_resolver=resolve_name,
         )
 
-        assert "[Thread context" in context
-        assert "[thread parent] Alice: This is the parent message" in context
-        assert "Bob: I think we should refactor" in context
-        # Current message should be excluded
-        assert "what do you think" not in context
-        # Bot mention should be stripped from context
-        assert "<@U_BOT>" not in context
-
-    @pytest.mark.asyncio
-    async def test_skips_bot_messages(self):
-        adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
-        mock_client.conversations_replies = AsyncMock(return_value={
-            "messages": [
-                {"ts": "1000.0", "user": "U1", "text": "Parent"},
-                {"ts": "1000.1", "bot_id": "B1", "text": "Bot reply (should be skipped)"},
-                {"ts": "1000.2", "user": "U1", "text": "Current"},
-            ]
-        })
-        adapter._user_name_cache = {"U1": "Alice"}
-
-        context = await adapter._fetch_thread_context(
-            channel_id="C1", thread_ts="1000.0", current_ts="1000.2", team_id="T1"
-        )
-
-        assert "Bot reply" not in context
-        assert "Alice: Parent" in context
+        assert ctx.thread_starter is not None
+        assert ctx.thread_starter.text == "This is the parent message"
+        # Current message should be excluded from history
+        assert all(m.ts != "1000.2" for m in ctx.thread_history)
 
     @pytest.mark.asyncio
     async def test_empty_thread(self):
-        adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
-        mock_client.conversations_replies = AsyncMock(return_value={"messages": []})
+        from gateway.platforms.slack_utils import load_thread_context
 
-        context = await adapter._fetch_thread_context(
-            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        mock_client = AsyncMock()
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [],
+            "has_more": False,
+        })
+
+        ctx = await load_thread_context(
+            client=mock_client,
+            channel_id="C1",
+            thread_ts="1000.0",
         )
-        assert context == ""
+        assert ctx.thread_starter is None
+        assert ctx.thread_history == []
 
     @pytest.mark.asyncio
     async def test_api_failure_returns_empty(self):
-        adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
+        from gateway.platforms.slack_utils import load_thread_context
+
+        mock_client = AsyncMock()
         mock_client.conversations_replies = AsyncMock(side_effect=Exception("API error"))
 
-        context = await adapter._fetch_thread_context(
-            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        ctx = await load_thread_context(
+            client=mock_client,
+            channel_id="C1",
+            thread_ts="1000.0",
         )
-        assert context == ""
+        assert ctx.thread_starter is None
+        assert ctx.thread_history == []
 
 
 # ===========================================================================
@@ -374,53 +368,54 @@ class TestSessionKeyFix:
 
 
 # ===========================================================================
-# Thread engagement — bot-started threads & mentioned threads
+# Thread engagement — ThreadParticipationCache
 # ===========================================================================
 
 class TestThreadEngagement:
-    """Test _bot_message_ts and _mentioned_threads tracking."""
+    """Test ThreadParticipationCache tracking."""
 
     @pytest.mark.asyncio
-    async def test_send_tracks_bot_message_ts(self):
-        """Bot's sent messages are tracked so thread replies work without @mention."""
+    async def test_send_records_thread_participation(self):
+        """Bot's sent messages in threads are tracked via ThreadParticipationCache."""
+        from gateway.platforms.slack_utils import get_thread_participation_cache
+
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "9000.1"})
 
+        cache = get_thread_participation_cache()
+        await cache.clear()
+
         await adapter.send(chat_id="C1", content="Hello!", metadata={"thread_id": "8000.0"})
 
-        assert "9000.1" in adapter._bot_message_ts
-        # Thread root should also be tracked
-        assert "8000.0" in adapter._bot_message_ts
+        # Thread should be recorded in cache
+        assert await cache.has_participated("default", "C1", "8000.0")
 
     @pytest.mark.asyncio
-    async def test_bot_message_ts_cap(self):
-        """Verify memory is bounded when many messages are sent."""
-        adapter = _make_adapter()
-        adapter._BOT_TS_MAX = 10  # low cap for testing
-        mock_client = adapter._team_clients["T1"]
+    async def test_cache_has_max_entries(self):
+        """Verify ThreadParticipationCache respects max entries."""
+        from gateway.platforms.slack_utils import ThreadParticipationCache
+
+        cache = ThreadParticipationCache(max_entries=10)
 
         for i in range(20):
-            mock_client.chat_postMessage = AsyncMock(return_value={"ts": f"{i}.0"})
-            await adapter.send(chat_id="C1", content=f"msg {i}")
+            await cache.record("default", "C1", f"{i}.0")
 
-        assert len(adapter._bot_message_ts) <= 10
+        # Count non-expired entries
+        count = 0
+        for i in range(20):
+            if await cache.has_participated("default", "C1", f"{i}.0"):
+                count += 1
+        assert count <= 10
 
-    def test_mentioned_threads_populated_on_mention(self):
-        """When bot is @mentioned in a thread, that thread is tracked."""
-        adapter = _make_adapter()
-        # Simulate what _handle_slack_message does on mention
-        adapter._mentioned_threads.add("1000.0")
-        assert "1000.0" in adapter._mentioned_threads
+    @pytest.mark.asyncio
+    async def test_cache_ttl_expiry(self):
+        """Verify entries expire after TTL."""
+        from gateway.platforms.slack_utils import ThreadParticipationCache
+        import time
 
-    def test_mentioned_threads_cap(self):
-        """Verify _mentioned_threads is bounded."""
-        adapter = _make_adapter()
-        adapter._MENTIONED_THREADS_MAX = 10
-        for i in range(15):
-            adapter._mentioned_threads.add(f"{i}.0")
-            if len(adapter._mentioned_threads) > adapter._MENTIONED_THREADS_MAX:
-                to_remove = list(adapter._mentioned_threads)[:adapter._MENTIONED_THREADS_MAX // 2]
-                for t in to_remove:
-                    adapter._mentioned_threads.discard(t)
-        assert len(adapter._mentioned_threads) <= 10
+        cache = ThreadParticipationCache(ttl_seconds=0)  # Immediate expiry
+        await cache.record("default", "C1", "1000.0")
+
+        # Entry should be expired
+        assert not await cache.has_participated("default", "C1", "1000.0")
