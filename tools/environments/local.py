@@ -190,6 +190,16 @@ def _make_run_env(env: dict) -> dict:
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
 
+    # Layer order (later wins): process env → caller-supplied env.
+    # Per-session env vars (stashed by gateway dispatch, e.g. webhook
+    # GH_TOKEN) are overlaid AFTER blocklist filtering: they're explicitly
+    # requested by the gateway and must bypass the credential blocklist,
+    # which exists to prevent leakage of developer-only creds.
+    try:
+        from tools.session_env import get_current_session_env_vars
+        _session_env = get_current_session_env_vars()
+    except Exception:
+        _session_env = {}
     merged = dict(os.environ | env)
     run_env = {}
     for k, v in merged.items():
@@ -201,6 +211,11 @@ def _make_run_env(env: dict) -> dict:
     existing_path = run_env.get("PATH", "")
     if "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+
+    # Overlay per-session env vars unconditionally (post-blocklist).
+    if _session_env:
+        for k, v in _session_env.items():
+            run_env[str(k)] = str(v)
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the

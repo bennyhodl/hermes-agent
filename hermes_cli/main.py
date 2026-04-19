@@ -7032,6 +7032,41 @@ For more help on a command:
         "message. Zero LLM cost. Requires --deliver to be a real target "
         "(not 'log').",
     )
+    wh_sub.add_argument(
+        "--github-app",
+        dest="github_app",
+        default="",
+        help=(
+            "Bind this subscription to a configured GitHub App (see "
+            "'hermes github-app list').  Webhooks arriving at "
+            "/webhooks/app/<app>  are fanned out to every route bound to "
+            "the app; an installation token is minted and injected as "
+            "GH_TOKEN / GITHUB_TOKEN for the agent run."
+        ),
+    )
+    wh_sub.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Payload filter — repeat to add multiple conditions "
+            "(ALL must match). Dot-notation for nested keys. "
+            "Short-circuits before agent runs (zero token cost). "
+            "Example: --filter action=closed --filter pull_request.merged=true "
+            "--filter pull_request.base.ref=dev"
+        ),
+    )
+    wh_sub.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help=(
+            "Bypass the dangerous-command approval gate for agent runs "
+            "triggered by this webhook. Required for unattended webhook "
+            "execution — there's no user to respond to approval prompts. "
+            "Equivalent to /yolo but scoped per-webhook-task."
+        ),
+    )
 
     webhook_subparsers.add_parser(
         "list", aliases=["ls"], help="List all dynamic subscriptions"

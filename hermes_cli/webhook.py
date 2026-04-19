@@ -145,6 +145,20 @@ def _cmd_subscribe(args):
     secret = args.secret or secrets.token_urlsafe(32)
     events = [e.strip() for e in args.events.split(",")] if args.events else []
 
+    # Parse repeatable --filter KEY=VALUE into dict. Last write wins on dup key.
+    filter_dict: Dict[str, str] = {}
+    for raw in getattr(args, "filter", None) or []:
+        if "=" not in raw:
+            print(f"Error: --filter entry '{raw}' must be KEY=VALUE")
+            return
+        key, _, value = raw.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            print(f"Error: --filter entry '{raw}' has empty key")
+            return
+        filter_dict[key] = value
+
     route = {
         "description": args.description or f"Agent-created subscription: {name}",
         "events": events,
@@ -163,6 +177,16 @@ def _cmd_subscribe(args):
             )
             return
         route["deliver_only"] = True
+
+    github_app = (getattr(args, "github_app", None) or "").strip()
+    if github_app:
+        route["github_app"] = github_app
+
+    if getattr(args, "auto_approve", False):
+        route["auto_approve"] = True
+
+    if filter_dict:
+        route["filter"] = filter_dict
 
     if args.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
@@ -183,6 +207,14 @@ def _cmd_subscribe(args):
     print(f"  Deliver: {route['deliver']}")
     if route.get("deliver_only"):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
+    if github_app:
+        print(f"  GitHub App: {github_app}")
+    if route.get("auto_approve"):
+        print(f"  Auto-approve: yes (dangerous-command gate bypassed)")
+    if filter_dict:
+        print("  Filter:")
+        for k, v in filter_dict.items():
+            print(f"    {k} == {v}")
     if route.get("prompt"):
         prompt_preview = route["prompt"][:80] + ("..." if len(route["prompt"]) > 80 else "")
         label = "Message" if route.get("deliver_only") else "Prompt"
@@ -190,6 +222,14 @@ def _cmd_subscribe(args):
     print(f"\n  Configure your service to POST to the URL above.")
     print(f"  Use the secret for HMAC-SHA256 signature validation.")
     print(f"  The gateway must be running to receive events (hermes gateway run).\n")
+
+    if github_app:
+        print(
+            f"  [!] GitHub App mode: point the GitHub App webhook URL at "
+            f"{base_url}/webhooks/app/{github_app}  — NOT at /webhooks/{name}.\n"
+            f"      The /webhooks/app/{{app}} endpoint fans out to every "
+            f"route bound to '{github_app}'.\n"
+        )
 
 
 def _cmd_list(args):
@@ -213,6 +253,12 @@ def _cmd_list(args):
         print(f"    URL:     {base_url}/webhooks/{name}")
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
+        if route.get("github_app"):
+            print(f"    GitHub App: {route['github_app']}  (fan-out URL: {base_url}/webhooks/app/{route['github_app']})")
+        filter_dict = route.get("filter") or {}
+        if filter_dict:
+            filter_desc = ", ".join(f"{k}={v}" for k, v in filter_dict.items())
+            print(f"    Filter:  {filter_desc}")
         print()
 
 

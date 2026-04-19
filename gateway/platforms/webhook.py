@@ -27,37 +27,55 @@ Security:
 """
 
 import asyncio
+import datetime as _dt
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
 try:
+    import aiohttp
     from aiohttp import web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    aiohttp = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.github_app_auth import (
+    GitHubAppAuth,
+    get_app as _get_github_app,
+    register_apps_from_config as _register_github_apps,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
 )
+from tools.approval import (
+    disable_session_yolo,
+    enable_session_yolo,
+)
+from tools.session_env import (
+    clear_session_env_vars,
+    set_session_env_vars,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
-_INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
+_INSECURE_NO_AUTH="***"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_MISSING = object()  # sentinel for "key absent" in payload filter walking
 
 
 def check_webhook_requirements() -> bool:
@@ -108,23 +126,41 @@ class WebhookAdapter(BasePlatformAdapter):
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
 
+        # Lazy-initialised shared aiohttp session for GitHub Check Run calls.
+        # Single session lets us reuse the HTTPS connection pool across
+        # start/complete pairs instead of paying TLS handshake cost every
+        # call. Initialised on first use (from an event-loop context) and
+        # closed in disconnect().
+        self._http: Optional["aiohttp.ClientSession"] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
+        # Register GitHub Apps from config (safe to call multiple times)
+        try:
+            n_apps = _register_github_apps(self.config)
+            if n_apps:
+                logger.info("[webhook] Registered %d GitHub App(s)", n_apps)
+        except Exception as e:  # defensive — never block startup
+            logger.warning("[webhook] GitHub App registration failed: %s", e)
+
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
         # Validate routes at startup — secret is required per route
+        # (or, for routes bound to a github_app, the app's webhook_secret
+        # can supply it — we do the resolution lazily in _resolve_secret()).
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
-            if not secret:
-                raise ValueError(
-                    f"[webhook] Route '{name}' has no HMAC secret. "
-                    f"Set 'secret' on the route or globally. "
-                    f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
-                )
+            if self._resolve_secret(route):
+                continue
+            raise ValueError(
+                f"[webhook] Route '{name}' has no HMAC secret. "
+                f"Set 'secret' on the route or globally, or bind it to a "
+                f"github_app that has webhook_secret configured. "
+                f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
+            )
 
             # deliver_only routes bypass the agent — the POST body becomes a
             # direct push notification via the configured delivery target.
@@ -141,6 +177,12 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        # Multi-match GitHub App fan-out endpoint.  MUST be registered
+        # BEFORE the generic single-route handler so aiohttp matches the
+        # more specific path first.
+        app.router.add_post(
+            "/webhooks/app/{app_name}", self._handle_app_webhook
+        )
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use
@@ -173,8 +215,20 @@ class WebhookAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        if self._http is not None:
+            try:
+                await self._http.close()
+            except Exception as e:  # pragma: no cover - shutdown path
+                logger.debug("[webhook] http close error: %s", e)
+            self._http = None
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
+
+    async def _get_http(self) -> "aiohttp.ClientSession":
+        """Return the adapter's shared aiohttp session, creating it lazily."""
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
 
     async def send(
         self,
@@ -197,10 +251,20 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            await self._finalize_check_from_delivery(delivery, content)
             return SendResult(success=True)
 
         if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
+            result = await self._deliver_github_comment(content, delivery)
+            if result.success:
+                await self._finalize_check_from_delivery(delivery, content)
+            else:
+                # Delivery failed — still close the check so it doesn't
+                # hang at in_progress forever.
+                await self._finalize_check_from_delivery(
+                    delivery, None  # None → classified as failure
+                )
+            return result
 
         # Cross-platform delivery — any platform with a gateway adapter
         if self.gateway_runner and deliver_type in (
@@ -222,9 +286,12 @@ class WebhookAdapter(BasePlatformAdapter):
             "bluebubbles",
             "qqbot",
         ):
-            return await self._deliver_cross_platform(
+            result = await self._deliver_cross_platform(
                 deliver_type, content, delivery
             )
+            if result.success:
+                await self._finalize_check_from_delivery(delivery, content)
+            return result
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(
@@ -321,7 +388,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response({"error": "Bad request"}, status=400)
 
         # Validate HMAC signature FIRST (skip for INSECURE_NO_AUTH testing mode)
-        secret = route_config.get("secret", self._global_secret)
+        secret = self._resolve_secret(route_config)
         if secret and secret != _INSECURE_NO_AUTH:
             if not self._validate_signature(request, raw_body, secret):
                 logger.warning(
@@ -342,50 +409,300 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
 
         # Parse payload
+        payload = self._parse_body(raw_body)
+        if payload is None:
+            return web.json_response(
+                {"error": "Cannot parse body"}, status=400
+            )
+
+        event_type = self._extract_event_type(request, payload)
+
+        # Dispatch to the single route
+        result = await self._dispatch_route(
+            route_name=route_name,
+            route_config=route_config,
+            payload=payload,
+            event_type=event_type,
+            request=request,
+        )
+        return web.json_response(result["body"], status=result["status"])
+
+    async def _handle_app_webhook(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /webhooks/app/{app_name} — multi-match fan-out endpoint.
+
+        One GitHub App webhook URL can target many installations and
+        repositories; we iterate every route whose ``github_app``
+        matches ``app_name`` and run each matching route in parallel.
+        """
+        self._reload_dynamic_routes()
+
+        app_name = request.match_info.get("app_name", "")
+        app = _get_github_app(app_name)
+        if app is None:
+            return web.json_response(
+                {"error": f"Unknown github_app: {app_name}"}, status=404
+            )
+
+        # Body-size pre-check
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response(
+                {"error": "Payload too large"}, status=413
+            )
+
+        # Rate limit on the app bucket
+        now = time.time()
+        rl_key = f"__app__:{app_name}"
+        window = self._rate_counts.setdefault(rl_key, [])
+        window[:] = [t for t in window if now - t < 60]
+        if len(window) >= self._rate_limit:
+            return web.json_response(
+                {"error": "Rate limit exceeded"}, status=429
+            )
+        window.append(now)
+
         try:
-            payload = json.loads(raw_body)
+            raw_body = await request.read()
+        except Exception as e:
+            logger.error("[webhook] Failed to read body: %s", e)
+            return web.json_response({"error": "Bad request"}, status=400)
+
+        # HMAC validation with the app's webhook_secret (shared across
+        # all routes bound to this app).  INSECURE_NO_AUTH bypass works
+        # when the app has no webhook_secret and is used for local tests.
+        secret = app.webhook_secret or ""
+        if secret and secret != _INSECURE_NO_AUTH:
+            if not self._validate_signature(request, raw_body, secret):
+                logger.warning(
+                    "[webhook] Invalid signature for app %s", app_name
+                )
+                return web.json_response(
+                    {"error": "Invalid signature"}, status=401
+                )
+
+        payload = self._parse_body(raw_body)
+        if payload is None:
+            return web.json_response(
+                {"error": "Cannot parse body"}, status=400
+            )
+
+        event_type = self._extract_event_type(request, payload)
+
+        # Gather all routes that belong to this app AND accept this event type.
+        # Per-route `events` filter is evaluated here so unrelated event types
+        # (push/check_run/etc.) don't spuriously fan out to every route.
+        # An empty `events` list on a route means "any event".
+        matching = []
+        skipped_by_event = []
+        for name, cfg in self._routes.items():
+            if cfg.get("github_app") != app_name:
+                continue
+            allowed = cfg.get("events") or []
+            if allowed and event_type not in allowed:
+                skipped_by_event.append(name)
+                continue
+            matching.append((name, cfg))
+
+        if not matching:
+            if skipped_by_event:
+                logger.debug(
+                    "[webhook] app=%s event=%s ignored by %d route(s): %s",
+                    app_name, event_type, len(skipped_by_event),
+                    ", ".join(skipped_by_event),
+                )
+            return web.json_response(
+                {
+                    "status": "no_matching_routes",
+                    "app": app_name,
+                    "event": event_type,
+                }
+            )
+
+        logger.info(
+            "[webhook] app=%s event=%s fan-out to %d route(s): %s",
+            app_name,
+            event_type,
+            len(matching),
+            ", ".join(n for n, _ in matching),
+        )
+
+        # Dispatch each matching route in parallel.  Each gets its own
+        # delivery_id suffix so idempotency is per-(route, delivery).
+        tasks = [
+            self._dispatch_route(
+                route_name=name,
+                route_config=cfg,
+                payload=payload,
+                event_type=event_type,
+                request=request,
+                delivery_suffix=name,
+            )
+            for name, cfg in matching
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        summary: List[dict] = []
+        for (name, _), res in zip(matching, results):
+            if isinstance(res, Exception):
+                summary.append({"route": name, "error": str(res)})
+            else:
+                summary.append({"route": name, **res["body"]})
+        return web.json_response(
+            {"status": "dispatched", "app": app_name, "routes": summary},
+            status=202,
+        )
+
+    # ------------------------------------------------------------------
+    # Dispatch pipeline (shared by single-match and fan-out handlers)
+    # ------------------------------------------------------------------
+
+    def _resolve_secret(self, route_config: dict) -> str:
+        """Return the effective HMAC secret for a route.
+
+        Resolution order (first non-empty wins):
+          1. ``route.secret``
+          2. Bound github_app's ``webhook_secret`` (if any)
+          3. The global ``platforms.webhook.secret``
+        """
+        secret = route_config.get("secret") or ""
+        if secret:
+            return secret
+        app_name = route_config.get("github_app")
+        if app_name:
+            app = _get_github_app(app_name)
+            if app and app.webhook_secret:
+                return app.webhook_secret
+        return self._global_secret or ""
+
+    @staticmethod
+    def _parse_body(raw_body: bytes) -> Optional[dict]:
+        try:
+            return json.loads(raw_body)
         except json.JSONDecodeError:
-            # Try form-encoded as fallback
             try:
                 import urllib.parse
 
-                payload = dict(
+                parsed_dict = dict(
                     urllib.parse.parse_qsl(raw_body.decode("utf-8"))
                 )
             except Exception:
-                return web.json_response(
-                    {"error": "Cannot parse body"}, status=400
-                )
+                return None
+            # GitHub classic webhooks post application/x-www-form-urlencoded
+            # with a single ``payload=<json>`` field. Unwrap it so downstream
+            # filters see the real payload dict instead of a bare string.
+            if "payload" in parsed_dict and isinstance(
+                parsed_dict["payload"], str
+            ):
+                try:
+                    unwrapped = json.loads(parsed_dict["payload"])
+                    if isinstance(unwrapped, dict):
+                        return unwrapped
+                except json.JSONDecodeError:
+                    pass
+            return parsed_dict
 
-        # Check event type filter
-        event_type = (
+    @staticmethod
+    def _extract_event_type(request: "web.Request", payload: dict) -> str:
+        return (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
             or payload.get("event_type", "")
             or "unknown"
         )
+
+    async def _dispatch_route(
+        self,
+        *,
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        event_type: str,
+        request: "web.Request",
+        delivery_suffix: str = "",
+    ) -> dict:
+        """Evaluate filters, mint tokens, spawn the agent task.
+
+        Returns a dict ``{"status": int, "body": dict}`` suitable for
+        the single-match JSON response, or the per-route summary entry
+        in the multi-match response.
+        """
+        # Event filter
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
                 "[webhook] Ignoring event %s for route %s (allowed: %s)",
-                event_type,
-                route_name,
-                allowed_events,
+                event_type, route_name, allowed_events,
             )
-            return web.json_response(
-                {"status": "ignored", "event": event_type}
-            )
+            return {
+                "status": 200,
+                "body": {"status": "ignored", "event": event_type},
+            }
 
-        # Format prompt from template
-        prompt_template = route_config.get("prompt", "")
+        # Payload filter
+        payload_filter = route_config.get("filter", {})
+        if payload_filter:
+            mismatch = self._filter_mismatch(payload, payload_filter)
+            if mismatch is not None:
+                key, expected, actual = mismatch
+                logger.debug(
+                    "[webhook] Filter mismatch for route %s: %s expected=%r actual=%r",
+                    route_name, key, expected, actual,
+                )
+                return {
+                    "status": 200,
+                    "body": {
+                        "status": "filtered",
+                        "event": event_type,
+                        "mismatch": {
+                            "key": key, "expected": expected, "actual": actual,
+                        },
+                    },
+                }
+
+        # GitHub App installation token injection.  We mint BEFORE the
+        # agent run so the env is populated when the background task
+        # starts; the token is attached to delivery_info and surfaced
+        # to tools via a task-scoped environment variable setter
+        # (see _inject_github_token_env).
+        gh_token: Optional[str] = None
+        gh_token_err: Optional[str] = None
+        app_name = route_config.get("github_app")
+        installation_id = None
+        if app_name:
+            inst = payload.get("installation") or {}
+            installation_id = inst.get("id")
+            if installation_id:
+                app = _get_github_app(app_name)
+                if app is None:
+                    gh_token_err = f"github_app '{app_name}' not registered"
+                else:
+                    gh_token, gh_token_err = await app.get_installation_token(
+                        int(installation_id)
+                    )
+                    if gh_token:
+                        logger.info(
+                            "[webhook] Minted installation token for "
+                            "app=%s installation=%s (prefix=%s…)",
+                            app_name, installation_id, gh_token[:6],
+                        )
+                    else:
+                        logger.warning(
+                            "[webhook] Could not mint token for app=%s install=%s: %s",
+                            app_name, installation_id, gh_token_err,
+                        )
+
+        # Prompt rendering
         prompt = self._render_prompt(
-            prompt_template, payload, event_type, route_name
+            route_config.get("prompt", ""),
+            payload, event_type, route_name,
         )
 
-        # Inject skill content if configured.
-        # We call build_skill_invocation_message() directly rather than
-        # using /skill-name slash commands — the gateway's command parser
-        # would intercept those and break the flow.
+        # Skill injection — stack ALL listed skills, not just the first.
+        # Order matters: earlier skills appear first in the prompt. Convention
+        # is to list the generic mechanics skill first (e.g. github-app-review),
+        # then the repo/context-specific skill (e.g. bitcoin-bay-website-review).
         skills = route_config.get("skills", [])
         if skills:
             try:
@@ -395,32 +712,47 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
                 skill_cmds = get_skill_commands()
+                loaded_parts: list[str] = []
                 for skill_name in skills:
                     cmd_key = f"/{skill_name}"
-                    if cmd_key in skill_cmds:
-                        skill_content = build_skill_invocation_message(
-                            cmd_key, user_instruction=prompt
-                        )
-                        if skill_content:
-                            prompt = skill_content
-                            break  # Load the first matching skill
-                    else:
+                    if cmd_key not in skill_cmds:
                         logger.warning(
                             "[webhook] Skill '%s' not found", skill_name
                         )
+                        continue
+                    # Pass user_instruction only to the LAST skill so the
+                    # instruction trails the skill stack (standard invocation
+                    # shape). Earlier skills get an empty instruction so they
+                    # act as pure context prefixes.
+                    is_last = skill_name == skills[-1]
+                    skill_content = build_skill_invocation_message(
+                        cmd_key,
+                        user_instruction=prompt if is_last else "",
+                    )
+                    if skill_content:
+                        loaded_parts.append(skill_content)
+
+                if loaded_parts:
+                    prompt = "\n\n---\n\n".join(loaded_parts)
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
+        # Delivery ID — include route-name suffix for multi-match fanout
+        # so each fanned route has a distinct idempotency key.
+        base_delivery = request.headers.get(
             "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            request.headers.get(
+                "X-Request-ID", str(int(time.time() * 1000))
+            ),
+        )
+        delivery_id = (
+            f"{base_delivery}:{delivery_suffix}"
+            if delivery_suffix
+            else base_delivery
         )
 
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Idempotency
         now = time.time()
-        # Prune expired entries
         self._seen_deliveries = {
             k: v
             for k, v in self._seen_deliveries.items()
@@ -430,10 +762,10 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
+            return {
+                "status": 200,
+                "body": {"status": "duplicate", "delivery_id": delivery_id},
+            }
         self._seen_deliveries[delivery_id] = now
 
         # ── Direct delivery mode (deliver_only) ─────────────────
@@ -498,9 +830,6 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        # Store delivery info for send().  Read by every send() invocation
-        # for this chat_id (interim status messages and the final response),
-        # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
         deliver_config = {
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
@@ -508,11 +837,79 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
             "payload": payload,
         }
+        # Stash token metadata on the delivery record for the agent
+        # subprocess / env-injection layer; never logged in full.
+        if gh_token:
+            deliver_config["gh_token"] = gh_token
+            deliver_config["gh_app"] = app_name
+            deliver_config["gh_installation_id"] = installation_id
+
+        # ── GitHub Check Run (in-progress) ──────────────────────────────
+        # Create a native GitHub check so the PR's "Checks" tab shows a
+        # live indicator while the agent runs. Gated on:
+        #   - we minted an App token (gh_token present)
+        #   - event is a pull_request event
+        #   - payload has pull_request.head.sha (targetable ref)
+        # Anything else → skip (no error).
+        #
+        # Feedback routes (merged PR feedback harvest) suffix the check
+        # name with "-feedback" so they don't collide with the normal
+        # review check, and always complete as ``neutral``.
+        pr = payload.get("pull_request") or {}
+        head_sha = (pr.get("head") or {}).get("sha") if isinstance(pr, dict) else None
+        repo_full_name = (payload.get("repository") or {}).get("full_name", "")
+        is_feedback_run = (
+            event_type == "pull_request"
+            and payload.get("action") == "closed"
+            and bool(pr.get("merged"))
+            and "github-app-review-feedback" in (route_config.get("skills") or [])
+        )
+        if (
+            gh_token
+            and event_type == "pull_request"
+            and head_sha
+            and repo_full_name
+        ):
+            check_name = (
+                f"{route_name}-feedback" if is_feedback_run else route_name
+            )
+            if is_feedback_run:
+                check_title = "Feedback harvest in progress"
+                check_summary = (
+                    f"{(app_name or 'Hermes').capitalize()} is harvesting post-merge feedback for this PR."
+                )
+            else:
+                check_title = "Hermes review in progress"
+                check_summary = (
+                    f"{(app_name or 'Hermes').capitalize()} is reviewing this pull request. See inline "
+                    "comments and final summary once complete."
+                )
+            try:
+                check_run_id = await self._start_github_check(
+                    gh_token=gh_token,
+                    repo_full_name=repo_full_name,
+                    head_sha=head_sha,
+                    name=check_name,
+                    details_url=pr.get("html_url"),
+                    title=check_title,
+                    summary=check_summary,
+                )
+                if check_run_id:
+                    deliver_config["check_run_id"] = check_run_id
+                    deliver_config["check_run_repo"] = repo_full_name
+                    deliver_config["check_run_feedback"] = is_feedback_run
+            except Exception as e:
+                # Defensive: _start_github_check already swallows its
+                # own errors, but make doubly sure a check-run hiccup
+                # never blocks the agent run.
+                logger.warning(
+                    "[webhook] _start_github_check raised unexpectedly "
+                    "for route %s: %s", route_name, e,
+                )
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
 
-        # Build source and event
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=f"webhook/{route_name}",
@@ -529,28 +926,68 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         logger.info(
-            "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
-            request.method,
-            event_type,
-            route_name,
-            len(prompt),
-            delivery_id,
+            "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s gh_token=%s",
+            request.method, event_type, route_name, len(prompt),
+            delivery_id, "yes" if gh_token else "no",
         )
 
-        # Non-blocking — return 202 Accepted immediately
-        task = asyncio.create_task(self.handle_message(event))
+        async def _run_with_env():
+            # Per-session env vars + YOLO latch, both keyed off the unique
+            # ``webhook:{route}:{delivery_id}`` session key.  This replaces
+            # the old process-global ``os.environ`` mutation, which raced
+            # across concurrent installations, and the old
+            # ``HERMES_YOLO_MODE`` env latch that leaked across sessions.
+            #
+            # The approval contextvar (``_approval_session_key``) is set in
+            # ``gateway/run.py`` before the agent loop runs, so tool calls
+            # executing in executor threads resolve the right session key
+            # automatically — see ``tools/session_env.py::get_current_session_env_vars``
+            # and ``tools/approval.py::is_current_session_yolo_enabled``.
+            auto_approve = bool(route_config.get("auto_approve"))
+            if gh_token:
+                set_session_env_vars(
+                    session_chat_id,
+                    {"GH_TOKEN": gh_token, "GITHUB_TOKEN": gh_token},
+                )
+                logger.info(
+                    "[webhook] route=%s GH_TOKEN scoped to session=%s (prefix=%s…)",
+                    route_name, session_chat_id, gh_token[:6],
+                )
+            if auto_approve:
+                enable_session_yolo(session_chat_id)
+                logger.info(
+                    "[webhook] route=%s auto_approve=on (session-scoped YOLO "
+                    "enabled for session=%s)",
+                    route_name, session_chat_id,
+                )
+            try:
+                await self.handle_message(event)
+            finally:
+                # Always clean up the session-scoped state. The YOLO latch
+                # and env vars only need to live as long as the agent run
+                # for this delivery; ``handle_message`` awaits through to
+                # completion on the normal path.
+                if gh_token:
+                    clear_session_env_vars(session_chat_id)
+                if auto_approve:
+                    disable_session_yolo(session_chat_id)
+
+        task = asyncio.create_task(_run_with_env())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-        return web.json_response(
-            {
-                "status": "accepted",
-                "route": route_name,
-                "event": event_type,
-                "delivery_id": delivery_id,
-            },
-            status=202,
-        )
+        body = {
+            "status": "accepted",
+            "route": route_name,
+            "event": event_type,
+            "delivery_id": delivery_id,
+        }
+        if gh_token:
+            body["github_app"] = app_name
+            body["installation_id"] = installation_id
+        elif gh_token_err:
+            body["github_app_error"] = gh_token_err
+        return {"status": 202, "body": body}
 
     # ------------------------------------------------------------------
     # Signature validation
@@ -644,6 +1081,76 @@ class WebhookAdapter(BasePlatformAdapter):
         return rendered
 
     # ------------------------------------------------------------------
+    # Payload filtering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_nested(payload: Any, dotted_key: str) -> Any:
+        """Walk a dotted key path through nested dicts. Returns None if
+        any segment is missing or a non-dict value is traversed.
+        A sentinel tuple is returned for 'missing' so callers can
+        distinguish 'key absent' from 'value is literally None'.
+        """
+        value: Any = payload
+        for part in dotted_key.split("."):
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return _MISSING
+        return value
+
+    @staticmethod
+    def _coerce_filter_value(raw: Any) -> Any:
+        """Coerce filter values that arrived as strings (from CLI/JSON
+        configs) into the JSON scalar they likely represent. Leaves
+        non-string values untouched."""
+        if not isinstance(raw, str):
+            return raw
+        lowered = raw.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if lowered in ("null", "none"):
+            return None
+        # int / float
+        try:
+            if lowered.lstrip("-").isdigit():
+                return int(raw)
+            return float(raw)
+        except (ValueError, AttributeError):
+            pass
+        return raw
+
+    def _filter_mismatch(
+        self, payload: dict, filter_dict: dict
+    ) -> Optional[tuple]:
+        """Return (key, expected, actual) for the first filter entry that
+        does not match the payload. Returns None if all entries match.
+
+        Matching semantics:
+          - Dot-notation key walks nested dicts (pull_request.base.ref).
+          - Expected values from CLI/JSON are coerced: "true"→True,
+            "false"→False, "null"→None, numeric strings → int/float.
+          - Equality is evaluated on the coerced value first, then falls
+            back to stringified comparison so users can write
+            ``pull_request.number=42`` against a JSON int without surprise.
+        """
+        for key, expected_raw in filter_dict.items():
+            actual = self._get_nested(payload, key)
+            if actual is _MISSING:
+                return (key, expected_raw, None)
+            expected = self._coerce_filter_value(expected_raw)
+            if actual == expected:
+                continue
+            # Fall back to stringified comparison (handles bool/int edge cases
+            # where the config author wrote a string by accident).
+            if str(actual).lower() == str(expected_raw).strip().lower():
+                continue
+            return (key, expected_raw, actual)
+        return None
+
+    # ------------------------------------------------------------------
     # Response delivery
     # ------------------------------------------------------------------
 
@@ -678,17 +1185,60 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _deliver_github_comment(
         self, content: str, delivery: dict
     ) -> SendResult:
-        """Post agent response as a GitHub PR/issue comment via ``gh`` CLI."""
+        """Post agent response as a GitHub PR/issue comment via ``gh`` CLI.
+
+        repo/pr_number resolution order:
+          1. Explicit deliver_extra.repo / pr_number (legacy single-route subs)
+          2. Derived from the stashed webhook payload (GitHub App / fan-out mode,
+             where repo+PR are dynamic per event). Supports both pull_request
+             and issue/issue_comment shapes.
+        """
         extra = delivery.get("deliver_extra", {})
         repo = extra.get("repo", "")
         pr_number = extra.get("pr_number", "")
 
+        # Fallback: derive from payload when not explicitly configured.
+        # This is the common case for GitHub App mode.
+        if not repo or not pr_number:
+            payload = delivery.get("payload") or {}
+            if not repo:
+                repo = (payload.get("repository") or {}).get("full_name", "")
+            if not pr_number:
+                pr_number = (
+                    (payload.get("pull_request") or {}).get("number")
+                    or (payload.get("issue") or {}).get("number")
+                    or payload.get("number")
+                    or ""
+                )
+
         if not repo or not pr_number:
             logger.error(
-                "[webhook] github_comment delivery missing repo or pr_number"
+                "[webhook] github_comment delivery missing repo or pr_number "
+                "(no deliver_extra and payload lacks repository.full_name / "
+                "pull_request.number / issue.number)"
             )
             return SendResult(
                 success=False, error="Missing repo or pr_number"
+            )
+
+        # Pull GitHub App installation token off the delivery record
+        # (populated by the App-mode fan-out path) and pass it via env so
+        # `gh` posts as the App's bot identity instead of whatever local
+        # credentials the gateway process happens to have. Without this,
+        # `gh` falls back to the gateway user's stored auth and comments
+        # land under the WRONG identity.
+        gh_token = delivery.get("gh_token")
+        gh_env = None
+        if gh_token:
+            gh_env = {**os.environ, "GH_TOKEN": gh_token, "GITHUB_TOKEN": gh_token}
+            # Ensure any pre-existing `gh auth` config isn't preferred over
+            # GH_TOKEN. `gh` prioritizes GH_TOKEN over stored auth by design,
+            # but being explicit about what identity we expect makes debug
+            # logs meaningful.
+            logger.debug(
+                "[webhook] github_comment using GH_TOKEN (prefix=%s…) "
+                "for %s#%s",
+                gh_token[:6], repo, pr_number,
             )
 
         try:
@@ -706,6 +1256,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=gh_env,
             )
             if result.returncode == 0:
                 logger.info(
@@ -728,6 +1279,215 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    # ------------------------------------------------------------------
+    # GitHub Check Run integration (App-authed PR reviews)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _iso8601_now() -> str:
+        return _dt.datetime.now(tz=_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    async def _start_github_check(
+        self,
+        *,
+        gh_token: str,
+        repo_full_name: str,
+        head_sha: str,
+        name: str,
+        details_url: Optional[str],
+        title: str = "Hermes review in progress",
+        summary: str = (
+            "Hermes is reviewing this pull request. See inline "
+            "comments and final summary once complete."
+        ),
+    ) -> Optional[int]:
+        """POST /repos/{owner}/{repo}/check-runs in ``in_progress`` state.
+
+        Returns the Check Run id on success, or None on failure (logged).
+        Never raises — a failing check must not block the agent run.
+        """
+        if not gh_token or not repo_full_name or not head_sha:
+            return None
+        url = f"https://api.github.com/repos/{repo_full_name}/check-runs"
+        body = {
+            "name": name,
+            "head_sha": head_sha,
+            "status": "in_progress",
+            "started_at": self._iso8601_now(),
+            "output": {"title": title, "summary": summary},
+        }
+        if details_url:
+            body["details_url"] = details_url
+        headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-webhook-adapter",
+        }
+        try:
+            session = await self._get_http()
+            async with session.post(
+                url, json=body, headers=headers, timeout=15
+            ) as resp:
+                data = await resp.json()
+                if resp.status >= 300:
+                    logger.warning(
+                        "[webhook] Check Run create failed "
+                        "(%s): status=%s body=%s",
+                        name, resp.status, data,
+                    )
+                    return None
+                check_id = data.get("id")
+                logger.info(
+                    "[webhook] Created Check Run id=%s name=%s repo=%s",
+                    check_id, name, repo_full_name,
+                )
+                return int(check_id) if check_id else None
+        except Exception as e:  # pragma: no cover - network path
+            logger.warning(
+                "[webhook] Check Run create errored (%s): %s", name, e
+            )
+            return None
+
+    @staticmethod
+    def _classify_review_conclusion(response: Optional[str]) -> tuple:
+        """Heuristic mapping of an agent's final-response string to a
+        GitHub Check Run ``(conclusion, title)``.
+
+        Simple substring matching. This is intentionally shallow — we can
+        replace it with structured output (e.g. a JSON verdict block) once
+        the review skill emits one.
+        """
+        if not response or not response.strip():
+            return ("failure", "Review failed")
+        text = response
+        lowered = text.lower()
+        # Gateway base-class error path sends a canned "Sorry, I
+        # encountered an error (…)" message when the agent raises.
+        # Surface that as a failure conclusion instead of a misleading
+        # neutral/suggestions-posted result.
+        if "sorry, i encountered an error" in lowered:
+            return ("failure", "Review failed")
+        # "critical" only counts if it isn't prefixed by a negation like
+        # "no critical issues" / "zero critical findings" — otherwise a
+        # clean review with that phrase would false-positive action_required.
+        has_critical = "critical" in lowered and not any(
+            neg in lowered
+            for neg in ("no critical", "zero critical", "not critical")
+        )
+        if (
+            "verdict: changes requested" in lowered
+            or "🔴" in text
+            or has_critical
+        ):
+            return ("action_required", "Review: changes requested")
+        if (
+            "lgtm" in lowered
+            or "no issues found" in lowered
+            or "0 findings" in lowered
+        ):
+            return ("success", "Review: LGTM")
+        return ("neutral", "Review: suggestions posted")
+
+    async def _complete_github_check(
+        self,
+        *,
+        gh_token: str,
+        repo_full_name: str,
+        check_run_id: int,
+        conclusion: str,
+        title: str,
+        summary: str,
+    ) -> bool:
+        """PATCH /repos/{owner}/{repo}/check-runs/{id} → completed.
+
+        Returns True on success. Never raises.
+        """
+        if not gh_token or not repo_full_name or not check_run_id:
+            return False
+        url = (
+            f"https://api.github.com/repos/{repo_full_name}"
+            f"/check-runs/{check_run_id}"
+        )
+        # GitHub caps output.summary at 65535 chars; we stay well under.
+        truncated = (summary or "")[:300]
+        body = {
+            "status": "completed",
+            "completed_at": self._iso8601_now(),
+            "conclusion": conclusion,
+            "output": {"title": title, "summary": truncated or title},
+        }
+        headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-webhook-adapter",
+        }
+        try:
+            session = await self._get_http()
+            async with session.patch(
+                url, json=body, headers=headers, timeout=15
+            ) as resp:
+                if resp.status >= 300:
+                    data = await resp.text()
+                    logger.warning(
+                        "[webhook] Check Run complete failed id=%s "
+                        "status=%s body=%s",
+                        check_run_id, resp.status, data[:500],
+                    )
+                    return False
+                logger.info(
+                    "[webhook] Completed Check Run id=%s "
+                    "conclusion=%s",
+                    check_run_id, conclusion,
+                )
+                return True
+        except Exception as e:  # pragma: no cover - network path
+            logger.warning(
+                "[webhook] Check Run complete errored id=%s: %s",
+                check_run_id, e,
+            )
+            return False
+
+    async def _finalize_check_from_delivery(
+        self, delivery: dict, response: Optional[str]
+    ) -> None:
+        """If the delivery has a pending Check Run, complete it based on
+        the agent's response. No-op if no check was started.
+        """
+        check_run_id = delivery.get("check_run_id")
+        if not check_run_id:
+            return
+        gh_token = delivery.get("gh_token")
+        repo = delivery.get("check_run_repo")
+        if not gh_token or not repo:
+            return
+        # Feedback-skill routes always report neutral/"Feedback harvested".
+        if delivery.get("check_run_feedback"):
+            conclusion = "neutral"
+            title = "Feedback harvested"
+            summary = (response or "Feedback harvested.")[:300]
+        else:
+            conclusion, title = self._classify_review_conclusion(response)
+            summary = (response or "")[:300]
+        await self._complete_github_check(
+            gh_token=gh_token,
+            repo_full_name=repo,
+            check_run_id=int(check_run_id),
+            conclusion=conclusion,
+            title=title,
+            summary=summary,
+        )
+        # Clear so we don't double-complete if send() is called twice
+        # (e.g. interim status + final response).
+        delivery.pop("check_run_id", None)
+
+    # ------------------------------------------------------------------
+    # Cross-platform delivery
+    # ------------------------------------------------------------------
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict

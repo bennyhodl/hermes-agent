@@ -758,3 +758,168 @@ class TestDeliverCrossPlatformThreadId:
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata=None
         )
+
+
+# ===================================================================
+# Payload filter (gate before agent runs — zero token cost)
+# ===================================================================
+
+
+class TestPayloadFilter:
+    """Tests for the dict-based payload filter:
+      - _get_nested walks dot-notation keys
+      - _coerce_filter_value turns "true"/"42" into JSON scalars
+      - _filter_mismatch returns None when all entries match,
+        or (key, expected, actual) for the first mismatch
+      - HTTP handler returns 200 {"status": "filtered"} on mismatch
+        WITHOUT dispatching to the agent (no new session created)
+    """
+
+    def test_get_nested_walks_dot_path(self):
+        payload = {"pull_request": {"base": {"ref": "dev"}}}
+        assert WebhookAdapter._get_nested(payload, "pull_request.base.ref") == "dev"
+
+    def test_get_nested_missing_returns_sentinel(self):
+        from gateway.platforms.webhook import _MISSING
+        assert WebhookAdapter._get_nested({}, "a.b") is _MISSING
+        assert WebhookAdapter._get_nested({"a": 1}, "a.b") is _MISSING
+
+    def test_coerce_bool_int_float_null(self):
+        c = WebhookAdapter._coerce_filter_value
+        assert c("true") is True
+        assert c("FALSE") is False
+        assert c("null") is None
+        assert c("42") == 42
+        assert c("3.14") == 3.14
+        assert c("dev") == "dev"
+        assert c(True) is True   # non-string pass-through
+        assert c(None) is None
+
+    def test_filter_all_match_returns_none(self):
+        adapter = _make_adapter()
+        payload = {
+            "action": "closed",
+            "pull_request": {"merged": True, "base": {"ref": "dev"}},
+        }
+        flt = {
+            "action": "closed",
+            "pull_request.merged": "true",
+            "pull_request.base.ref": "dev",
+        }
+        assert adapter._filter_mismatch(payload, flt) is None
+
+    def test_filter_mismatch_branch(self):
+        adapter = _make_adapter()
+        payload = {"action": "closed", "pull_request": {"base": {"ref": "master"}}}
+        flt = {"pull_request.base.ref": "dev"}
+        m = adapter._filter_mismatch(payload, flt)
+        assert m is not None
+        key, expected, actual = m
+        assert key == "pull_request.base.ref"
+        assert actual == "master"
+
+    def test_filter_mismatch_not_merged(self):
+        adapter = _make_adapter()
+        payload = {"action": "closed", "pull_request": {"merged": False}}
+        flt = {"pull_request.merged": "true"}
+        m = adapter._filter_mismatch(payload, flt)
+        assert m is not None
+        assert m[0] == "pull_request.merged"
+
+    def test_filter_missing_key_is_mismatch(self):
+        adapter = _make_adapter()
+        m = adapter._filter_mismatch({}, {"action": "closed"})
+        assert m is not None
+        assert m[0] == "action"
+        assert m[2] is None
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_filtered_status_and_skips_agent(self):
+        """End-to-end: a non-matching payload returns {"status":"filtered"}
+        and never runs the agent (no session_chat_id ever generated)."""
+        routes = {
+            "qa-dev": {
+                "events": ["pull_request"],
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "SHOULD NOT RUN",
+                "deliver": "log",
+                "filter": {
+                    "action": "closed",
+                    "pull_request.merged": "true",
+                    "pull_request.base.ref": "dev",
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+
+        # Patch the dispatch path to detect accidental agent invocation
+        with patch.object(
+            adapter, "_render_prompt", wraps=adapter._render_prompt
+        ) as spy_render:
+            # Non-matching: base.ref = master
+            body = json.dumps({
+                "action": "closed",
+                "pull_request": {
+                    "merged": True,
+                    "base": {"ref": "master"},
+                },
+            }).encode()
+            req = _mock_request(
+                headers={"X-GitHub-Event": "pull_request"},
+                body=body,
+                match_info={"route_name": "qa-dev"},
+            )
+            resp = await adapter._handle_webhook(req)
+            data = json.loads(resp.body.decode())
+            assert data["status"] == "filtered"
+            assert data["mismatch"]["key"] == "pull_request.base.ref"
+            # Prompt rendering must never have been reached
+            spy_render.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_proceeds_when_filter_matches(self):
+        """Matching payload proceeds past the filter (prompt rendered)."""
+        routes = {
+            "qa-dev": {
+                "events": ["pull_request"],
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "PR #{pull_request.number} merged to dev",
+                "deliver": "log",
+                "filter": {
+                    "action": "closed",
+                    "pull_request.merged": "true",
+                    "pull_request.base.ref": "dev",
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        # Stub the downstream agent-dispatch step so the test stays unit-level.
+        adapter._dispatch_to_agent = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+
+        # We don't need the real dispatch; patch at the module level to
+        # confirm _render_prompt IS called (filter passed).
+        with patch.object(
+            adapter, "_render_prompt", wraps=adapter._render_prompt
+        ) as spy_render:
+            body = json.dumps({
+                "action": "closed",
+                "pull_request": {
+                    "number": 42,
+                    "merged": True,
+                    "base": {"ref": "dev"},
+                },
+            }).encode()
+            req = _mock_request(
+                headers={"X-GitHub-Event": "pull_request"},
+                body=body,
+                match_info={"route_name": "qa-dev"},
+            )
+            # The handler will try to go further than prompt rendering (to
+            # emit an agent event). That path touches a lot of infra we don't
+            # want to set up for this unit test, so we accept any exception
+            # AFTER _render_prompt — we just want to prove the filter passed.
+            try:
+                await adapter._handle_webhook(req)
+            except Exception:
+                pass
+            spy_render.assert_called()  # filter passed → prompt was rendered
