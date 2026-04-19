@@ -4080,6 +4080,15 @@ def cmd_webhook(args):
     webhook_command(args)
 
 
+def cmd_github_app(args):
+    """GitHub App authentication management."""
+    from hermes_cli.github_app import github_app_command
+    rc = github_app_command(args)
+    if isinstance(rc, int) and rc != 0:
+        import sys as _sys
+        _sys.exit(rc)
+
+
 def cmd_doctor(args):
     """Check configuration and dependencies."""
     from hermes_cli.doctor import run_doctor
@@ -5905,6 +5914,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "import",
         "completion",
         "logs",
+        "github-app",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
 
@@ -7041,6 +7051,49 @@ For more help on a command:
     )
 
     webhook_parser.set_defaults(func=cmd_webhook)
+
+    # =========================================================================
+    # github-app command
+    # =========================================================================
+    gha_parser = subparsers.add_parser(
+        "github-app",
+        help="Manage GitHub App authentication (JWT + installation tokens)",
+        description=(
+            "Mint and inspect GitHub App installation tokens using the "
+            "private key configured under platforms.webhook.extra.github_apps "
+            "in ~/.hermes/config.yaml.  Tokens are cached at "
+            "~/.hermes/cache/github-app-tokens.json and shared with the "
+            "webhook adapter."
+        ),
+    )
+    gha_sub = gha_parser.add_subparsers(dest="github_app_action")
+
+    gha_sub.add_parser("list", help="List configured GitHub Apps and their reachability")
+
+    gha_inst = gha_sub.add_parser("installations", help="List installations for an app")
+    gha_inst.add_argument("app", help="Configured app name")
+
+    gha_tok = gha_sub.add_parser(
+        "token",
+        help="Print a fresh installation token (just the token, for $(...) use)",
+    )
+    gha_tok.add_argument("app", help="Configured app name")
+    gha_tok.add_argument(
+        "--installation", type=int, default=None,
+        help="Installation id (required if the app has >1 installation)",
+    )
+
+    gha_git = gha_sub.add_parser(
+        "setup-git",
+        help="Configure git credential helper to use hermes-minted tokens for github.com",
+    )
+    gha_git.add_argument("app", nargs="?", default=None, help="Configured app name (auto-picked if only one app is configured)")
+    gha_git.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what would be changed without modifying git config",
+    )
+
+    gha_parser.set_defaults(func=cmd_github_app)
 
     # =========================================================================
     # doctor command
